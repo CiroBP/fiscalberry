@@ -144,7 +144,7 @@ class FiscalberryApp(App):
     def _request_android_permissions(self):
         """Solicita todos los permisos necesarios en Android automáticamente"""
         try:
-            from fiscalberry.common.android_permissions import (
+            from fiscalberry.android.permissions import (
                 request_all_permissions,
                 check_all_permissions
             )
@@ -379,6 +379,7 @@ class FiscalberryApp(App):
             # CRÍTICO: Verificar Battery Exemption PRIMERO
             self._check_and_request_battery_exemption()
             
+            # Solicitar permisos por etapas
             try:
                 from fiscalberry.android.permissions import (
                     check_all_permissions, 
@@ -387,7 +388,13 @@ class FiscalberryApp(App):
                 
                 perms = check_all_permissions()
                 if not perms['all_granted']:
-                    request_all_permissions()
+                    # request_all_permissions ahora maneja las etapas internamente
+                    # y llama al callback cuando termina
+                    request_all_permissions(callback_on_complete=self._on_all_permissions_complete)
+                else:
+                    logger.info("✅ Todos los permisos ya otorgados")
+                    # Aún así verificar notificaciones (Etapa 3)
+                    self._request_notification_permission()
             except Exception as e:
                 logger.error(f"Error gestionando permisos Android: {e}")
         else:
@@ -397,7 +404,60 @@ class FiscalberryApp(App):
                     Clock.schedule_once(lambda dt: self._set_windows_icon_delayed(icon_path), 1)
             except Exception as e:
                 logger.error(f"Error en on_start configurando icono: {e}")
-    
+   
+    def _on_all_permissions_complete(self, success):
+        """
+        Callback cuando se completan todas las etapas de permisos (Core + Background).
+        
+        Args:
+            success: True si los permisos se otorgaron correctamente
+        """
+        logger.info(f"Permisos completados - Success: {success}")
+        
+        # ETAPA 3: Solicitar notificaciones (última etapa)
+        # Esto se hace al final para no abrumar al usuario
+        self._request_notification_permission()
+
+   
+    def _request_notification_permission(self):
+        """
+        Solicita permiso de notificaciones usando request_permissions.
+        CRÍTICO: En Android 13+ (API 33+) se requiere POST_NOTIFICATIONS.
+        """
+        try:
+            from jnius import autoclass
+            
+            BuildVersion = autoclass('android.os.Build$VERSION')
+            if BuildVersion.SDK_INT < 33:
+                logger.debug("Android < 13: POST_NOTIFICATIONS no requerido")
+                return True
+        
+            # Verificar si ya está otorgado
+            from fiscalberry.android.permissions import check_permission
+            if check_permission('android.permission.POST_NOTIFICATIONS'):
+                logger.info("✅ POST_NOTIFICATIONS ya otorgado")
+                return True
+        
+            logger.warning("⚠️ POST_NOTIFICATIONS no otorgado - solicitando diálogo nativo...")
+        
+            # Solicitar permiso usando request_permissions de python-for-android
+            try:
+                from android.permissions import request_permissions
+                
+                logger.info("📱 Mostrando diálogo de permiso POST_NOTIFICATIONS...")
+                request_permissions(['android.permission.POST_NOTIFICATIONS'])
+                logger.debug("✓ Diálogo de permiso POST_NOTIFICATIONS solicitado")
+                return True
+            except Exception as e:
+                logger.error(f"Error solicitando POST_NOTIFICATIONS: {e}")
+                return False
+            
+        except ImportError:
+            return True  # No es Android
+        except Exception as e:
+            logger.error(f"Error verificando notification permission: {e}", exc_info=True)
+            return False
+
     def _check_and_request_battery_exemption(self):
         """
         Verifica y solicita exclusión de optimización de batería.
@@ -660,7 +720,7 @@ class FiscalberryApp(App):
         """Callback cuando se completa la solicitud de permisos"""
         if not success:
             self._show_permission_warning()
-    
+
     def _show_permission_warning(self):
         """Muestra advertencia sobre permisos faltantes en la UI actual"""
         try:

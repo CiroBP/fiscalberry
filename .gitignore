@@ -111,6 +111,7 @@ ENV/
 
 
 .vscode/
+.idea/
 fiscalberry3env
 pyvenv.cfg
 

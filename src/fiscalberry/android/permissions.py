@@ -62,10 +62,9 @@ FISCALBERRY_PERMISSIONS_API_29_PLUS = [
 ]
 
 FISCALBERRY_PERMISSIONS_API_31_PLUS = [
+    'android.permission.ACCESS_FINE_LOCATION',  # Requerido para BLUETOOTH_SCAN
     'android.permission.BLUETOOTH_CONNECT',  # Nuevos permisos de Bluetooth desde API 31
     'android.permission.BLUETOOTH_SCAN',
-    'android.permission.ACCESS_FINE_LOCATION',  # Requerido para BLUETOOTH_SCAN
-    'android.permission.SCHEDULE_EXACT_ALARM',  # Para reconexiones programadas
 ]
 
 # API 33+: Permiso explícito para notificaciones (incluyendo foreground service)
@@ -84,6 +83,9 @@ FISCALBERRY_PERMISSIONS_STORAGE_LEGACY = [
 def get_required_permissions():
     """
     Obtiene la lista de permisos requeridos según la versión de Android.
+    
+    NOTA: Esta función devuelve TODOS los permisos juntos (legacy).
+    Para solicitud por etapas, usar get_core_permissions() y get_background_permissions().
     
     Returns:
         list: Lista de permisos requeridos para la versión actual
@@ -125,6 +127,122 @@ def get_required_permissions():
 
 # Mantener compatibilidad con código existente
 FISCALBERRY_PERMISSIONS = get_required_permissions()
+
+
+def get_core_permissions():
+    """
+    Permisos críticos que se solicitan primero (Etapa 1).
+    NO incluye ACCESS_BACKGROUND_LOCATION ni POST_NOTIFICATIONS.
+    
+    Incluye:
+    - Internet y red
+    - Bluetooth básico
+    - Ubicación FOREGROUND (COARSE/FINE)
+    - Bluetooth moderno (CONNECT/SCAN)
+    - Foreground Service
+    - Almacenamiento (solo Android 12-)
+    
+    Returns:
+        list: Permisos core para la versión actual
+    """
+    if not ANDROID:
+        return []
+    
+    permissions = [
+        'android.permission.INTERNET',
+        'android.permission.ACCESS_NETWORK_STATE',
+        'android.permission.ACCESS_WIFI_STATE',
+        'android.permission.WAKE_LOCK',
+        'android.permission.BLUETOOTH',
+        'android.permission.BLUETOOTH_ADMIN',
+    ]
+    
+    # Almacenamiento solo en Android 12 y anteriores
+    if ANDROID_API_LEVEL < 33:
+        permissions.extend([
+            'android.permission.READ_EXTERNAL_STORAGE',
+            'android.permission.WRITE_EXTERNAL_STORAGE',
+        ])
+        logger.debug(f"Core: agregando permisos de almacenamiento (API {ANDROID_API_LEVEL})")
+    
+    # Ubicación FOREGROUND (requerida para Bluetooth en API 23+)
+    if ANDROID_API_LEVEL >= 23:
+        permissions.append('android.permission.ACCESS_COARSE_LOCATION')
+        logger.debug("Core: agregando ACCESS_COARSE_LOCATION")
+    
+    if ANDROID_API_LEVEL >= 28:
+        permissions.append('android.permission.FOREGROUND_SERVICE')
+        logger.debug("Core: agregando FOREGROUND_SERVICE")
+    
+    # Bluetooth moderno + Ubicación FINE (API 31+)
+    if ANDROID_API_LEVEL >= 31:
+        permissions.extend([
+            'android.permission.ACCESS_FINE_LOCATION',  # Requerido para BLUETOOTH_SCAN
+            'android.permission.BLUETOOTH_CONNECT',
+            'android.permission.BLUETOOTH_SCAN',
+        ])
+        logger.debug("Core: agregando Bluetooth moderno + ACCESS_FINE_LOCATION")
+    
+    logger.debug(f"Permisos core para API {ANDROID_API_LEVEL}: {len(permissions)} permisos")
+    return permissions
+
+
+def get_background_permissions():
+    """
+    Permisos sensibles que se solicitan DESPUÉS de los core (Etapa 2).
+    
+    CRÍTICO: Solo incluye ACCESS_BACKGROUND_LOCATION si los permisos
+    foreground (FINE o COARSE) ya están otorgados.
+    
+    Incluye:
+    - Ubicación BACKGROUND (solo si foreground otorgado)
+    - SCHEDULE_EXACT_ALARM  (por ahora fue retirado por no ser necesario y tirar errores)
+    
+    Returns:
+        list: Permisos background para la versión actual
+    """
+    if not ANDROID:
+        return []
+    
+    permissions = []
+    
+    # Ubicación BACKGROUND (API 29+)
+    # CRÍTICO: Solo solicitar si ACCESS_FINE_LOCATION o ACCESS_COARSE_LOCATION ya están otorgados
+    if ANDROID_API_LEVEL >= 29:
+        # Verificar que al menos uno de los permisos foreground esté otorgado
+        has_foreground = (
+            check_permission('android.permission.ACCESS_FINE_LOCATION') or
+            check_permission('android.permission.ACCESS_COARSE_LOCATION')
+        )
+        if has_foreground:
+            permissions.append('android.permission.ACCESS_BACKGROUND_LOCATION')
+            logger.debug("Background: agregando ACCESS_BACKGROUND_LOCATION (foreground otorgado)")
+        else:
+            logger.warning("Background: ACCESS_BACKGROUND_LOCATION omitido (foreground no otorgado)")
+    
+    logger.debug(f"Permisos background para API {ANDROID_API_LEVEL}: {len(permissions)} permisos")
+    return permissions
+
+
+def get_notification_permissions():
+    """
+    Permisos de notificaciones (Etapa 3).
+    
+    NOTA: Ya se maneja en fiscalberry_app.py con _request_notification_permission(),
+    pero incluido aquí para completitud.
+    
+    Returns:
+        list: Permisos de notificaciones para la versión actual
+    """
+    if not ANDROID:
+        return []
+    
+    if ANDROID_API_LEVEL >= 33:
+        logger.debug("Notification: agregando POST_NOTIFICATIONS")
+        return ['android.permission.POST_NOTIFICATIONS']
+    
+    return []
+
 
 
 def is_permission_supported(permission):
@@ -228,9 +346,14 @@ def check_all_permissions():
         return {'all_granted': False, 'details': {}, 'missing': []}
 
 
+
 def request_all_permissions(callback_on_complete: Optional[Callable] = None):
     """
-    Solicita todos los permisos necesarios de una vez.
+    Solicita permisos en etapas para cumplir con restricciones de Android 11+.
+    
+    Etapa 1: Core permissions (Bluetooth, Internet, Ubicación Foreground)
+    Etapa 2: Background permissions (solo si Foreground fue otorgado)
+    Etapa 3: Notifications (manejado en fiscalberry_app.py)
     
     Args:
         callback_on_complete: Función a llamar cuando se complete la solicitud
@@ -245,56 +368,116 @@ def request_all_permissions(callback_on_complete: Optional[Callable] = None):
         return True
     
     try:
-        logger.debug(f"Solicitando permisos de Android para API {ANDROID_API_LEVEL}...")
-        required_permissions = get_required_permissions()
+        logger.info("🔐 Iniciando solicitud de permisos por etapas...")
         
-        # Filtrar solo los permisos que no están otorgados
-        missing_permissions = []
-        for permission in required_permissions:
-            try:
-                if not check_permission(permission):
-                    missing_permissions.append(permission)
-                    logger.debug(f"Permiso faltante: {permission}")
-            except:
-                missing_permissions.append(permission)
+        # ETAPA 1: Permisos Core
+        core_permissions = get_core_permissions()
+        missing_core = [p for p in core_permissions if not check_permission(p)]
         
-        if missing_permissions:
-            logger.info(f"Solicitando {len(missing_permissions)} permisos faltantes...")
-            logger.info("⚠️ El usuario verá diálogos de permisos del sistema")
-            
-            # Método 1: Usar request_permissions de python-for-android
-            try:
-                logger.debug("Intentando solicitar permisos con request_permissions()...")
-                request_permissions(missing_permissions)
-                logger.debug("✓ request_permissions() ejecutado")
-            except Exception as e1:
-                logger.warning(f"request_permissions() falló: {e1}")
-                
-                # Método 2: Usar ActivityCompat directamente
-                try:
-                    logger.debug("Intentando con ActivityCompat...")
-                    _request_permissions_via_activity_compat(missing_permissions)
-                except Exception as e2:
-                    logger.error(f"ActivityCompat también falló: {e2}")
-            
-            # Esperar un poco para que el usuario responda
-            if callback_on_complete:
-                # Programar verificación después de 2 segundos
-                from kivy.clock import Clock
-                Clock.schedule_once(lambda dt: _verify_and_callback(callback_on_complete), 2)
-            
-            return True
+        if missing_core:
+            logger.info(f"📱 Etapa 1: Solicitando {len(missing_core)} permisos core...")
+            logger.debug(f"Permisos core faltantes: {missing_core}")
+            _request_permissions_stage(
+                missing_core,
+                lambda success: _on_core_permissions_granted(success, callback_on_complete)
+            )
         else:
-            logger.debug("Todos los permisos ya están otorgados")
-            if callback_on_complete:
-                callback_on_complete(True)
-            return True
-            
+            logger.debug("✅ Permisos core ya otorgados")
+            # Pasar directamente a etapa 2
+            _request_background_permissions(callback_on_complete)
+        
+        return True
+        
     except Exception as e:
-        logger.error(f"Error solicitando permisos: {e}", exc_info=True)
+        logger.error(f"Error en solicitud de permisos: {e}", exc_info=True)
         if callback_on_complete:
             callback_on_complete(False)
         return False
+
+
+def _on_core_permissions_granted(success, final_callback):
+    """Callback después de solicitar permisos core."""
+    if success:
+        logger.info("✅ Permisos core otorgados")
+    else:
+        logger.warning("⚠️ Algunos permisos core fueron denegados")
+    
+    # Continuar con permisos background de todas formas
+    # (puede que algunos core se hayan otorgado)
+    _request_background_permissions(final_callback)
+
+
+def _request_background_permissions(final_callback):
+    """Solicita permisos background (Etapa 2)."""
+    try:
+        background_permissions = get_background_permissions()
+        
+        if not background_permissions:
+            logger.debug("No hay permisos background para solicitar")
+            if final_callback:
+                final_callback(True)
+            return
+        
+        missing_background = [p for p in background_permissions if not check_permission(p)]
+        
+        if missing_background:
+            logger.info(f"📱 Etapa 2: Solicitando {len(missing_background)} permisos background...")
+            logger.debug(f"Permisos background faltantes: {missing_background}")
+            
+            # IMPORTANTE: Delay de 1 segundo antes de solicitar background
+            # Esto da tiempo al usuario a procesar los diálogos anteriores
+            from kivy.clock import Clock
+            Clock.schedule_once(
+                lambda dt: _request_permissions_stage(missing_background, final_callback),
+                1.0
+            )
+        else:
+            logger.debug("✅ Permisos background ya otorgados")
+            if final_callback:
+                final_callback(True)
+                
+    except Exception as e:
+        logger.error(f"Error solicitando permisos background: {e}")
+        if final_callback:
+            final_callback(False)
+
+
+def _request_permissions_stage(permissions, callback):
+    """
+    Solicita un conjunto de permisos y ejecuta callback al completar.
+    
+    Args:
+        permissions: Lista de permisos a solicitar
+        callback: Función a llamar después de solicitar (recibe bool success)
+    """
+    try:
+        logger.debug(f"Solicitando {len(permissions)} permisos...")
+        
+        # Método 1: request_permissions de python-for-android
+        try:
+            logger.debug("Intentando con request_permissions()...")
+            request_permissions(permissions)
+            logger.debug("✓ request_permissions() ejecutado")
+        except Exception as e1:
+            logger.warning(f"request_permissions() falló: {e1}")
+            
+            # Método 2: ActivityCompat
+            try:
+                logger.debug("Intentando con ActivityCompat...")
+                _request_permissions_via_activity_compat(permissions)
+            except Exception as e2:
+                logger.error(f"ActivityCompat también falló: {e2}")
+        
+        # Programar verificación después de 2 segundos
+        if callback:
+            from kivy.clock import Clock
+            Clock.schedule_once(lambda dt: _verify_and_callback(callback), 2)
+        
+    except Exception as e:
+        logger.error(f"Error en _request_permissions_stage: {e}")
+        if callback:
+            callback(False)
+
 
 
 def _verify_and_callback(callback: Callable):
@@ -454,6 +637,52 @@ def request_bluetooth_permissions():
         logger.error(f"Error solicitando permisos de Bluetooth: {e}", exc_info=True)
         return False
 
+def request_notification_permission_native():
+    """
+    Solicita permiso POST_NOTIFICATIONS usando el diálogo nativo de Android.
+    Solo para Android 13+ (API 33+).
+    
+    Returns:
+        bool: True si el permiso ya está otorgado o se solicitó correctamente
+    """
+    if not ANDROID:
+        return True
+    
+    if ANDROID_API_LEVEL < 33:
+        logger.debug("Android < 13: POST_NOTIFICATIONS no requerido")
+        return True
+    
+    try:
+        # Verificar si ya está otorgado
+        if check_permission('android.permission.POST_NOTIFICATIONS'):
+            logger.debug("POST_NOTIFICATIONS ya otorgado")
+            return True
+        
+        from jnius import autoclass
+        
+        PythonActivity = autoclass('org.kivy.android.PythonActivity')
+        Settings = autoclass('android.provider.Settings')
+        Intent = autoclass('android.content.Intent')
+        
+        activity = PythonActivity.mActivity
+        if not activity:
+            logger.warning("Activity no disponible")
+            return False
+        
+        logger.info("⚠️ Solicitando permiso POST_NOTIFICATIONS...")
+        
+        # Abrir configuración de notificaciones de la app
+        intent = Intent()
+        intent.setAction(Settings.ACTION_APP_NOTIFICATION_SETTINGS)
+        intent.putExtra(Settings.EXTRA_APP_PACKAGE, activity.getPackageName())
+        
+        activity.startActivity(intent)
+        logger.debug("Configuración de notificaciones abierta")
+        return True
+        
+    except Exception as e:
+        logger.error(f"Error solicitando POST_NOTIFICATIONS: {e}", exc_info=True)
+        return False
 
 def get_permissions_status_summary():
     """
